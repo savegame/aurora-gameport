@@ -1,0 +1,6 @@
+# SVN-метаданные stk-assets
+.svn/
+
+# Артефакты сборки AuroraSDK
+build/
+RPMS/
