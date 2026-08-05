@@ -105,7 +105,7 @@ static void on_key( void *ud, int type, int qt_key, int qt_mods,
 static void on_visibility( void *ud, bool visible )
 {
 	(void)ud; (void)visible;
-	/* Purely informational for now. Could drive VGui layout later. */
+	/* Purely informational for now. Could drive UI layout later. */
 }
 
 static void on_area( void *ud, int x, int y, int w, int h )
@@ -149,11 +149,11 @@ void maliit_bridge_pump( void )
 	maliit_client_pump();
 
 	/*
-	 * Some engine paths (VGui menu close on Enter, key_dest flip to
-	 * key_game, ESC-out of a dialog) drop the text-input state without
-	 * routing back through Platform_EnableTextInput. Trust SDL's own
-	 * flag as the source of truth and hide the OSK whenever it turned
-	 * off behind our back.
+	 * Some engine paths (menu closed with Enter, game-state switch,
+	 * ESC-out of a dialog) may drop the text-input state without
+	 * routing back through the enable/disable entry point. Trust
+	 * SDL's own flag as the source of truth and hide the OSK
+	 * whenever it turned off behind our back.
 	 */
 	if( s.text_active && !SDL_IsTextInputActive())
 		maliit_bridge_enable_text_input( false );

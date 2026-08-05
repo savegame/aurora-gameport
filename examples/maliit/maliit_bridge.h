@@ -1,9 +1,9 @@
 /*
- * maliit_bridge.h -- glue between the maliit_client wrapper and the
- * xash3d SDL2 platform layer.
+ * maliit_bridge.h -- glue between the maliit_client wrapper and an
+ * engine's SDL2 platform layer.
  *
  * The wrapper is transport-agnostic; this bridge turns its callbacks into
- * SDL_PushEvent so the rest of the engine — VGui, console, menus — sees
+ * SDL_PushEvent so the rest of the engine — UI, console, menus — sees
  * regular SDL_TEXTINPUT / SDL_KEYDOWN events without knowing maliit exists.
  *
  * All entry points are safe to call before/after init; they no-op when the
@@ -29,7 +29,8 @@ void maliit_bridge_shutdown( void );
 void maliit_bridge_pump( void );
 
 /*
- * Route Platform_EnableTextInput here. On enable: focus_in + show.
+ * Route the engine's text-input enable/disable entry point here
+ * (e.g. an SDL_StartTextInput wrapper). On enable: focus_in + show.
  * On disable: focus_out + hide.
  */
 void maliit_bridge_enable_text_input( bool enable );

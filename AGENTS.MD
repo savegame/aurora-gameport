@@ -23,7 +23,7 @@
    Запиши ответы в `port_config.json` в корне репозитория:
    ```json
    {
-     "project_url": "https://github.com/supertuxkart/stk-code",
+     "project_url": "https://github.com/example/mygame",
      "sfdk": "/path/to/AuroraSDK/bin/sfdk",
      "target": "AuroraOS-5.1.3.85-MB2",
      "mode": "auto"
@@ -48,7 +48,7 @@
 
 ## Цель портирования
 Проект: берётся из `port_config.json`.
-Пример: https://github.com/supertuxkart/stk-code
+Пример: https://github.com/example/mygame
 Тег: посмотри, какие есть ветки и теги, бери последний стабильный
 релиз.
 

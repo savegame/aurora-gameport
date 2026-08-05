@@ -45,9 +45,9 @@ sed -i "s/__LAUNCHER_NAME__/%{_app_launcher_name}/g" %{name}.desktop
 
 install -m 655 -D %{name}.desktop %{buildroot}%{_datadir}/applications/%{name}.desktop
 
-pushd game
-zip -FS -r -y %{buildroot}%{_datadir}/%{name}/game.love *
-popd
+# install game data files
+# install -d %{buildroot}%{_datadir}/%{name}
+# cp -r game/data %{buildroot}%{_datadir}/%{name}/
 
 %files
 %defattr(-,root,root,-)
