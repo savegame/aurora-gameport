@@ -14,31 +14,41 @@ GNU General Public License for more details.
 */
 
 /*
-Stage A scope:
+Scope:
   * Create an SDL window + GLES3 context with the same attributes the
     engine will later expect.
-  * Initialise ImGui (SDL2 platform + OpenGL3 renderer, ES3 mode).
-  * Render one panel with a single "Continue" button.
-  * Touch events are translated to mouse events so the upstream SDL2
-    backend handles them without modification.
-  * On Continue: shut down ImGui (releases its own VAO/VBO/program/font
+  * Initialise ImGui (SDL2 platform + OpenGL3 renderer, ES3 mode), apply
+    the port's theme (theme.cpp, palette from docs/imgui-theme-spec.md).
+  * Tabs: Game (resource picker + start buttons, one per mod/DLC),
+    Settings (FBO scale), About (disclaimer + links).
+  * Touch: SDL on AuroraOS sends finger events (tfinger, normalised 0..1),
+    not mouse events (mouse-from-touch synthesis is disabled by a hint in
+    Launcher_Run). A tap (<16 px of travel) becomes a mouse down+up pair;
+    a drag becomes MouseWheel pulses so ImGui lists scroll 1:1 under the
+    finger.
+  * On Start: shut down ImGui (releases its own VAO/VBO/program/font
     texture) but leave the SDL window and GL context alive. The engine's
-    window-creation code will see Launcher_GetWindow/GLContext non-NULL
+    window-creation code must see Launcher_GetWindow/GLContext non-NULL
     and skip its own creation calls — critical on AuroraOS where the
     compositor terminates apps whose window disappears even briefly.
 */
 
 #include "launcher.h"
+#include "theme.h"
 
 #include <SDL.h>
 #include <SDL_video.h>
-#include <SDL_syswm.h>
+#include <SDL_misc.h> /* SDL_OpenURL */
 
 #include <GLES3/gl3.h>
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
+
+/* Font embedded into the package: Noto Sans Bold (Cyrillic), stb-compressed
+   array. Regenerate with binary_to_compressed_c from the TTF if needed. */
+#include "fonts/NotoSansBold.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,14 +64,38 @@ Stage A scope:
 #include <vector>
 #include <algorithm>
 
+/* Sandbox identifiers (the build system passes them as string defines; they
+   must match the organisation/application identifiers in port_config.json
+   and the RPM spec — see AGENTS.MD). */
+#ifndef AURORA_ORG
+#define AURORA_ORG "org.example"
+#endif
+#ifndef AURORA_APP
+#define AURORA_APP "mygame"
+#endif
+
 namespace {
 
 SDL_Window    *g_window  = nullptr;
 SDL_GLContext  g_context = nullptr;
 bool           g_owned   = false; // true while launcher still owns the window/context
 
+/* Launcher widgets are 20% more compact than the font scale: at a
+   comfortable font size the default widget metrics looked oversized. All
+   explicit widget sizes are derived from ES() instead of
+   ImGui::GetFontSize() (the font itself is not scaled), and the theme
+   metrics are additionally multiplied by kElemScale after ApplyTheme
+   (see Launcher_Run). */
+static const float kElemScale = 0.8f;
+static inline float ES() { return ImGui::GetFontSize() * kElemScale; }
+
+/* Extra vertical compression (font untouched): buttons 20% lower,
+   tabs 30% lower. */
+static const float kBtnScale = 0.8f;
+static const float kTabScale = 0.7f;
+
 // ----------------------------------------------------------------------
-// Resource path picker state
+// Resource picker state and launcher result
 // ----------------------------------------------------------------------
 struct PickerState
 {
@@ -69,27 +103,42 @@ struct PickerState
 	std::string selected;    // last confirmed pick (the resource root)
 	bool        browser_open = false;
 	bool        valid_pick   = false; // selected points at a valid resource root
+	/* Presence of mods/DLC (see kMods). Scanned ONCE when `selected`
+	   changes — probing the filesystem every frame would spam the log and
+	   stall the UI. */
+	std::vector<bool> mod_present;
 };
 
 PickerState g_picker;
 
-// SDL touch-drag → ImGui scroll. We DO NOT translate finger motion into
-// mouse motion (would cause buttons to drag-select). Instead a drag
-// becomes MouseWheel pulses applied to whatever ImGui window is hovered;
-// a tap (no significant motion) emits a single mouse-button down+up at
-// the original finger position.
+/* Deferred directory-browser open: the "Browse..." button fires on the
+   tap release, and the browser window is drawn later in the same frame —
+   without the deferral the same release would "fall through" into the
+   just-opened window and click whatever sits under the finger. The flag is
+   set on click, the open happens at the start of the next frame
+   (DrawLauncherUI). */
+bool g_browser_open_pending = false;
+
+/* Result: which game variant to start ("" = base game, otherwise the mod
+   id from kMods). */
+bool        g_launch = false;
+std::string g_launch_mod;
+
+/* Touch: tap vs drag. Finger motion is NOT translated into mouse motion
+   (buttons would drag-select): a drag becomes MouseWheel pulses to the
+   hovered ImGui window, a tap is a single down+up at the touch point. */
 struct TouchState
 {
 	bool  active     = false;
 	float start_x    = 0.f, start_y = 0.f;
-	float last_x     = 0.f, last_y = 0.f;
+	float last_x     = 0.f, last_y  = 0.f;
 	float total_dist = 0.f;
 };
 TouchState g_touch;
 float      g_scroll_pending_px = 0.f;
 
 // ----------------------------------------------------------------------
-// Validation: does `dir` look like a usable game resource root?
+// Filesystem helpers and resource-root validation
 // ----------------------------------------------------------------------
 bool PathExists( const std::string &p )
 {
@@ -103,33 +152,66 @@ bool IsDir( const std::string &p )
 	return stat( p.c_str(), &st ) == 0 && S_ISDIR( st.st_mode );
 }
 
+/* A resource root is valid if it contains the files/directories
+   characteristic of the engine's resource layout. Adapt to your game.
+   Example:
+     return PathExists( dir + "/gamedata/gameinfo.txt" ); */
 bool ValidateResourceDir( const std::string &dir )
 {
 	if( !IsDir( dir )) return false;
-	// Adapt to your game: check for the files/directories characteristic of
-	// the engine's resource layout. Example:
-	// if( PathExists( dir + "/gamedata/gameinfo.txt" )) return true;
 	return false;
 }
 
-// ----------------------------------------------------------------------
-// Persistent config: stores the last picked resource path.
-//   $XDG_CONFIG_HOME/<org>/<app>/launcher.conf  (or ~/.config/...)
-// ----------------------------------------------------------------------
-// On AuroraOS the package sandbox only allows writes under
-//   ~/.local/share/<org>/<app>
-//   ~/.cache/<org>/<app>
-//   ~/.config/<org>/<app>
-// Compose these from the build-time defines. The build system passes them
-// in; they must match the organisation/application identifiers in
-// port_config.json and the RPM spec (see AGENTS.MD).
-#ifndef AURORA_ORG
-#define AURORA_ORG "org.example"
-#endif
-#ifndef AURORA_APP
-#define AURORA_APP "mygame"
-#endif
+/* Mods/DLC: label on the start button + subdirectory name under the
+   resource root that identifies the mod. Leave empty if the game has no
+   mods. Example:
+     { "Mission Pack",  "missionpack" },
+     { "Capture Mode",  "ctf"         }, */
+struct ModDef { const char *label; const char *id; };
+static const std::vector<ModDef> kMods = {
+};
 
+/* A mod is present if <dir>/<mod>/ contains at least one regular file.
+   Adapt the filter to the engine (e.g. require a specific extension). */
+bool HasMod( const std::string &dir, const char *mod )
+{
+	std::string sub = dir + "/" + mod;
+	DIR *d = opendir( sub.c_str());
+	if( !d ) return false;
+	bool found = false;
+	dirent *ent;
+	while(( ent = readdir( d )))
+	{
+		const char *n = ent->d_name;
+		if( n[0] == '.' ) continue;
+		std::string full = sub + "/" + n;
+		struct stat st;
+		if( stat( full.c_str(), &st ) == 0 && S_ISREG( st.st_mode ))
+		{
+			found = true;
+			break;
+		}
+	}
+	closedir( d );
+	printf( "Launcher: mod '%s' in '%s': %s\n", mod, sub.c_str(), found ? "found" : "not found" );
+	return found;
+}
+
+/* Rescan mods once per picked directory. */
+void RescanMods()
+{
+	g_picker.mod_present.assign( kMods.size(), false );
+	if( g_picker.selected.empty())
+		return;
+	for( size_t i = 0; i < kMods.size(); ++i )
+		g_picker.mod_present[i] = HasMod( g_picker.selected, kMods[i].id );
+}
+
+// ----------------------------------------------------------------------
+// Persistent config: ~/.config/<org>/<app>/launcher.conf, key=value.
+//   path       — last picked resource root
+//   r_3d_scale — offscreen render scale factor (FBO)
+// ----------------------------------------------------------------------
 std::string HomeDir()
 {
 	const char *home = getenv( "HOME" );
@@ -143,29 +225,13 @@ std::string HomeDir()
 
 std::string ConfigDir()
 {
-	// $XDG_CONFIG_HOME normally maps to ~/.config. On AuroraOS the sandbox
-	// constrains writes under ~/.config/<org>/<app>.
-	// const char *xdg = getenv( "XDG_CONFIG_HOME" );
-	std::string base = HomeDir() + "/.config";
-	base += "/" AURORA_ORG "/" AURORA_APP;
-	return base;
+	/* The AuroraOS sandbox only allows writes under ~/.config/<org>/<app>
+	   (and ~/.local/share, ~/.cache) — elsewhere the write is silently
+	   swallowed and the config is lost on the next launch. */
+	return HomeDir() + "/.config/" AURORA_ORG "/" AURORA_APP;
 }
 
-std::string DataDir()
-{
-	const char *xdg = getenv( "XDG_DATA_HOME" );
-	std::string base = ( xdg && *xdg ) ? std::string( xdg )
-	                                   : HomeDir() + "/.local/share";
-	return base + "/" AURORA_ORG "/" AURORA_APP;
-}
-
-std::string CacheDir()
-{
-	const char *xdg = getenv( "XDG_CACHE_HOME" );
-	std::string base = ( xdg && *xdg ) ? std::string( xdg )
-	                                   : HomeDir() + "/.cache";
-	return base + "/" AURORA_ORG "/" AURORA_APP;
-}
+std::string ConfigFile() { return ConfigDir() + "/launcher.conf"; }
 
 void MakeDirsP( const std::string &path )
 {
@@ -180,16 +246,10 @@ void MakeDirsP( const std::string &path )
 	}
 }
 
-std::string ConfigFile() { return ConfigDir() + "/launcher.conf"; }
-
-// launcher.conf is a trivial key=value store, one entry per line.
-// Recognised keys:
-//   path       — last picked resource root
-//   r_3d_scale — offscreen render scale factor
 struct LauncherSettings
 {
 	std::string path;
-	float       r_3d_scale = 0.5f;
+	float       r_3d_scale = 1.0f;
 };
 
 LauncherSettings g_settings;
@@ -207,22 +267,15 @@ void LoadSettings()
 	FILE *f = fopen( ConfigFile().c_str(), "rb" );
 	if( !f ) return;
 	char line[4096];
-	// First-line backwards compat: if the file predates key=value it was a
-	// bare path. Detect by absence of '='.
 	while( fgets( line, sizeof( line ), f ))
 	{
 		std::string s = TrimStr( line );
 		if( s.empty() || s[0] == '#' ) continue;
 		size_t eq = s.find( '=' );
-		if( eq == std::string::npos )
-		{
-			// legacy bare-path file
-			g_settings.path = s;
-			continue;
-		}
+		if( eq == std::string::npos ) continue;
 		std::string k = TrimStr( s.substr( 0, eq ));
 		std::string v = TrimStr( s.substr( eq + 1 ));
-		if( k == "path" )       g_settings.path = v;
+		if( k == "path" )            g_settings.path = v;
 		else if( k == "r_3d_scale" ) g_settings.r_3d_scale = (float)atof( v.c_str());
 	}
 	fclose( f );
@@ -235,51 +288,34 @@ void SaveSettings()
 	MakeDirsP( ConfigDir());
 	FILE *f = fopen( ConfigFile().c_str(), "wb" );
 	if( !f ) return;
-	fprintf( f, "path=%s\n",       g_settings.path.c_str());
+	fprintf( f, "path=%s\n",         g_settings.path.c_str());
 	fprintf( f, "r_3d_scale=%.3f\n", g_settings.r_3d_scale );
 	fclose( f );
 }
 
-// Backwards-compat wrappers used by the picker.
-std::string LoadConfigPath() { return g_settings.path; }
-void SaveConfigPath( const std::string &p )
+/* Browser start directory: the picked path if any, else the conventional
+   AuroraOS location ~/Downloads/Games/<app>, else ~/Downloads. */
+std::string DefaultBrowserDir()
 {
-	g_settings.path = p;
-	SaveSettings();
-}
-
-// Best-effort fallback when no config saved yet.
-std::string DefaultStartDir()
-{
-	const char *home = getenv( "HOME" );
-	if( !home || !*home )
-	{
-		passwd *pw = getpwuid( getuid());
-		home = pw ? pw->pw_dir : "/";
-	}
-	// Aurora maps user storage to ~/Downloads / ~/Documents.
-	if( IsDir( std::string( home ) + "/Downloads" )) return std::string( home ) + "/Downloads";
-	if( IsDir( std::string( home ) + "/Documents" )) return std::string( home ) + "/Documents";
-	return std::string( home );
+	if( !g_picker.selected.empty()) return g_picker.selected;
+	std::string home = HomeDir();
+	std::string games = home + "/Downloads/Games/" AURORA_APP;
+	if( IsDir( games ))                    return games;
+	if( IsDir( home + "/Downloads" ))      return home + "/Downloads";
+	return home;
 }
 
 // ----------------------------------------------------------------------
-// Touch event handling — tap vs drag decision.
+// Touch events: tap vs drag (finger coordinates are normalised 0..1)
 // ----------------------------------------------------------------------
 void ProcessTouchEvent( const SDL_Event &in, int win_w, int win_h )
 {
 	if( in.type != SDL_FINGERDOWN && in.type != SDL_FINGERUP && in.type != SDL_FINGERMOTION )
 		return;
 
-	float fx = in.tfinger.x;
-	float fy = in.tfinger.y;
-	if( fx > 1.0f || fy > 1.0f )
-	{
-		fx /= (float)win_w;
-		fy /= (float)win_h;
-	}
-	float px = fx * (float)win_w;
-	float py = fy * (float)win_h;
+	/* tfinger.x/y are normalised 0..1 — scale to window pixels. */
+	float px = in.tfinger.x * (float)win_w;
+	float py = in.tfinger.y * (float)win_h;
 
 	const float TAP_THRESHOLD = 16.f;
 
@@ -292,8 +328,8 @@ void ProcessTouchEvent( const SDL_Event &in, int win_w, int win_h )
 		g_touch.last_y     = py;
 		g_touch.total_dist = 0.f;
 
-		// Move ImGui mouse to finger position so hover-test picks the right
-		// window for any subsequent scroll deltas.
+		/* Move the ImGui "mouse" under the finger so the hover test picks
+		   the right window for any subsequent scroll. */
 		SDL_Event mv = {};
 		mv.type = SDL_MOUSEMOTION;
 		mv.motion.timestamp = in.tfinger.timestamp;
@@ -309,7 +345,7 @@ void ProcessTouchEvent( const SDL_Event &in, int win_w, int win_h )
 		g_touch.total_dist += sqrtf( dx * dx + dy * dy );
 		g_touch.last_x = px;
 		g_touch.last_y = py;
-		// Once the finger has clearly moved we treat the gesture as scroll.
+		/* The finger has clearly moved — the gesture is a scroll. */
 		if( g_touch.total_dist >= TAP_THRESHOLD )
 			g_scroll_pending_px += dy;
 	}
@@ -317,7 +353,7 @@ void ProcessTouchEvent( const SDL_Event &in, int win_w, int win_h )
 	{
 		if( g_touch.total_dist < TAP_THRESHOLD )
 		{
-			// Tap — emit down+up at original position so ImGui registers a click.
+			/* Tap — down+up at the original point so ImGui sees a click. */
 			SDL_Event d = {};
 			d.type = SDL_MOUSEBUTTONDOWN;
 			d.button.timestamp = in.tfinger.timestamp;
@@ -342,15 +378,17 @@ void ApplyPendingScroll()
 {
 	if( g_scroll_pending_px == 0.f ) return;
 	ImGuiIO &io = ImGui::GetIO();
-	// Convert pixel delta to wheel ticks. ImGui scrolls about
-	// GetFontSize() pixels per tick; tuning factor for finger feel.
-	const float px_per_tick = 28.f;
+	/* Pixels -> wheel ticks: ImGui scrolls 5*FontSize px per tick
+	   (UpdateMouseWheel: scroll_step = min(5*FontSize, 0.67*window
+	   height)). Dividing by exactly that step makes the content track the
+	   finger 1:1. */
+	const float px_per_tick = 5.f * ImGui::GetFontSize();
 	io.MouseWheel += g_scroll_pending_px / px_per_tick;
 	g_scroll_pending_px = 0.f;
 }
 
 // ----------------------------------------------------------------------
-// Directory listing helper (subdirectories only).
+// Directory listing helper (subdirectories only)
 // ----------------------------------------------------------------------
 std::vector<std::string> ListSubdirs( const std::string &dir )
 {
@@ -361,8 +399,7 @@ std::vector<std::string> ListSubdirs( const std::string &dir )
 	while(( ent = readdir( d )))
 	{
 		const char *n = ent->d_name;
-		if( n[0] == '.' && ( n[1] == 0 || ( n[1] == '.' && n[2] == 0 ))) continue; // skip . and ..
-		if( n[0] == '.' ) continue; // skip hidden
+		if( n[0] == '.' ) continue; /* skip hidden entries and . / .. */
 		std::string full = dir + "/" + n;
 		if( IsDir( full )) out.push_back( n );
 	}
@@ -378,13 +415,14 @@ std::string ParentOf( const std::string &dir )
 {
 	if( dir.empty() || dir == "/" ) return "/";
 	size_t s = dir.find_last_of( '/' );
-	if( s == std::string::npos ) return "/";
-	if( s == 0 ) return "/";
+	if( s == std::string::npos || s == 0 ) return "/";
 	return dir.substr( 0, s );
 }
 
-// Mirror the GL attribute set the engine will request when it creates its
-// own window/GL context. Keep these in sync.
+// ----------------------------------------------------------------------
+// GL attributes: mirror the set the engine will request for its own
+// window/context. Keep these in sync.
+// ----------------------------------------------------------------------
 void SetGLAttributesForEngine()
 {
 	SDL_GL_SetAttribute( SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES );
@@ -406,11 +444,14 @@ void SetGLAttributesForEngine()
 	SDL_GL_SetAttribute( SDL_GL_DOUBLEBUFFER, 1 );
 }
 
+// ----------------------------------------------------------------------
+// Directory browser (on top of the main launcher window)
+// ----------------------------------------------------------------------
 void DrawDirectoryBrowser( int win_w, int win_h )
 {
 	if( !g_picker.browser_open ) return;
 
-	const float fs = ImGui::GetFontSize();
+	const float fs = ES();
 	ImGui::SetNextWindowPos(  ImVec2( fs * 0.5f, fs * 0.5f ));
 	ImGui::SetNextWindowSize( ImVec2( win_w - fs, win_h - fs ));
 	ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
@@ -427,15 +468,15 @@ void DrawDirectoryBrowser( int win_w, int win_h )
 	ImGui::TextWrapped( "%s", g_picker.current_dir.c_str());
 	ImGui::Spacing();
 
-	const float row_h = fs * 2.5f;
+	const float row_h = fs * 2.5f * kBtnScale;
 
-	// Action buttons span the full width of the browser window and stack
-	// vertically — fits any phone orientation without horizontal overflow.
+	/* Action buttons span the full width and stack vertically (touch). */
 	if( ImGui::Button( "Выбрать эту папку", ImVec2( -1, row_h )))
 	{
-		g_picker.selected   = g_picker.current_dir;
-		g_picker.valid_pick = ValidateResourceDir( g_picker.selected );
+		g_picker.selected     = g_picker.current_dir;
+		g_picker.valid_pick   = ValidateResourceDir( g_picker.selected );
 		g_picker.browser_open = false;
+		RescanMods();
 	}
 	if( ImGui::Button( "Вверх", ImVec2( -1, row_h )))
 		g_picker.current_dir = ParentOf( g_picker.current_dir );
@@ -444,14 +485,43 @@ void DrawDirectoryBrowser( int win_w, int win_h )
 
 	ImGui::Separator();
 
-	// Scrollable list of subdirectories — every entry is a big touch target.
+	/* Subdirectories — a flat list (visually NOT buttons): Selectable with
+	   no background, left-aligned text, a "[  ]" marker before the name
+	   (no emoji in the font — the glyph ranges don't include them). The
+	   first entry is always "[  ] .." — go up one level. Every entry is
+	   inset 3 mm from both edges of the scroll view (the launcher font is
+	   4.5 mm, so compute from the real font size, not the squashed ES). */
+	const float pad_x  = ImGui::GetFontSize() * ( 3.f / 4.5f );
+	const float item_h = row_h * 0.9f;
 	ImGui::BeginChild( "##dir_list", ImVec2( 0, 0 ), false,
 		ImGuiWindowFlags_AlwaysVerticalScrollbar );
+
+	/* Highlight entries only while the finger is on the screen. After
+	   FINGERUP the synthetic mouse stays at the tap point, and the entry
+	   with the same index in the NEW list would stay "hovered" — without a
+	   touch, suppress hover/active. */
+	const bool highlight = g_touch.active;
+	if( !highlight )
+	{
+		ImGui::PushStyleColor( ImGuiCol_HeaderHovered, ImVec4( 0, 0, 0, 0 ));
+		ImGui::PushStyleColor( ImGuiCol_HeaderActive,  ImVec4( 0, 0, 0, 0 ));
+	}
+
+	auto drawItem = [&]( const char *label ) -> bool
+	{
+		ImGui::SetCursorPosX( ImGui::GetCursorPosX() + pad_x );
+		return ImGui::Selectable( label, false, 0,
+			ImVec2( ImGui::GetContentRegionAvail().x - pad_x, item_h ));
+	};
+
+	if( drawItem( "[  ] .." ))
+		g_picker.current_dir = ParentOf( g_picker.current_dir );
 
 	auto subs = ListSubdirs( g_picker.current_dir );
 	for( const auto &name : subs )
 	{
-		if( ImGui::Button( name.c_str(), ImVec2( -1, row_h * 0.9 )))
+		std::string label = "[  ] " + name;
+		if( drawItem( label.c_str()))
 		{
 			std::string next = g_picker.current_dir;
 			if( next != "/" ) next += "/";
@@ -460,17 +530,28 @@ void DrawDirectoryBrowser( int win_w, int win_h )
 		}
 	}
 
+	if( !highlight )
+		ImGui::PopStyleColor( 2 );
+
 	ImGui::EndChild();
 
 	ImGui::PopStyleVar( 2 );
 	ImGui::End();
 }
 
-void DrawTab_Game( bool &keep_running, bool &user_quit, int win_w, int win_h )
+// ----------------------------------------------------------------------
+// Tab "Game"
+// ----------------------------------------------------------------------
+void StartGame( const char *mod )
 {
-	const float fs    = ImGui::GetFontSize();
-	const float btn_w = fs * 16.f;
-	const float btn_h = fs * 3.5f;
+	g_launch     = true;
+	g_launch_mod = mod;
+}
+
+void DrawTab_Game()
+{
+	const float fs    = ES();
+	const float btn_h = fs * 3.3f * kBtnScale;
 
 	ImGui::Text( "Путь к ресурсам:" );
 	ImGui::TextWrapped( "%s", g_picker.selected.empty()
@@ -478,13 +559,8 @@ void DrawTab_Game( bool &keep_running, bool &user_quit, int win_w, int win_h )
 		: g_picker.selected.c_str());
 
 	ImGui::Spacing();
-	if( ImGui::Button( "Выбрать папку...", ImVec2( fs * 14.f, btn_h )))
-	{
-		g_picker.current_dir = g_picker.selected.empty()
-			? DefaultStartDir()
-			: g_picker.selected;
-		g_picker.browser_open = true;
-	}
+	if( ImGui::Button( "Выбрать папку...", ImVec2( -1, btn_h )))
+		g_browser_open_pending = true; /* opens on the next frame */
 
 	ImGui::Spacing();
 	if( g_picker.selected.empty())
@@ -503,36 +579,43 @@ void DrawTab_Game( bool &keep_running, bool &user_quit, int win_w, int win_h )
 			"В выбранной папке не найдены ресурсы игры." );
 	}
 
-	ImGui::Dummy( ImVec2( 0, fs * 1.f ));
+	ImGui::Dummy( ImVec2( 0, fs * 0.5f ));
 
-	const bool can_continue = !g_picker.selected.empty() && g_picker.valid_pick;
-	ImGui::BeginDisabled( !can_continue );
-	ImGui::SetCursorPosX(( win_w - btn_w ) * 0.5f );
-	if( ImGui::Button( "Начать игру", ImVec2( btn_w, btn_h * 1.2f )))
+	const bool can_launch = !g_picker.selected.empty() && g_picker.valid_pick;
+	ImGui::BeginDisabled( !can_launch );
+
+	/* Base game. TODO: button label — the game's name. */
+	if( ImGui::Button( "Начать игру", ImVec2( -1, btn_h )))
+		StartGame( "" );
+
+	/* Mod/DLC buttons: always visible, disabled when the mod's files were
+	   not found under the picked directory (RescanMods cache). */
+	for( size_t i = 0; i < kMods.size(); ++i )
 	{
-		keep_running = false;
-		user_quit    = false;
+		ImGui::BeginDisabled( !g_picker.mod_present[i] );
+		if( ImGui::Button( kMods[i].label, ImVec2( -1, btn_h )))
+			StartGame( kMods[i].id );
+		ImGui::EndDisabled();
 	}
+	if( !kMods.empty())
+		ImGui::TextDisabled( "Дополнения активны при наличии их файлов в папке ресурсов" );
+
 	ImGui::EndDisabled();
-
-	ImGui::SetCursorPosX(( win_w - btn_w ) * 0.5f );
-	if( ImGui::Button( "Выход", ImVec2( btn_w, btn_h )))
-	{
-		keep_running = false;
-		user_quit    = true;
-	}
 }
 
+// ----------------------------------------------------------------------
+// Tab "Settings"
+// ----------------------------------------------------------------------
 void DrawTab_Settings()
 {
-	const float fs = ImGui::GetFontSize();
+	const float fs = ES();
 
 	ImGui::Dummy( ImVec2( 0, fs * 0.5f ));
 	ImGui::TextWrapped( "Разрешение рендера (3D scale)" );
 	ImGui::TextWrapped(
-		"Множитель размера FBO относительно окна. 0.5 = половина разрешения "
-		"(быстрее), 1.0 = полное, 2.0 = supersample. Меняется на следующем "
-		"запуске игры." );
+		"Множитель размера буфера рендеринга относительно экрана. "
+		"0.5 = половина разрешения (быстрее), 1.0 = полное, "
+		"2.0 = supersampling (чётче, но медленнее)." );
 	ImGui::Dummy( ImVec2( 0, fs * 0.5f ));
 
 	ImGui::PushItemWidth( -fs * 4.f );
@@ -540,8 +623,8 @@ void DrawTab_Settings()
 	ImGui::PopItemWidth();
 
 	ImGui::Spacing();
-	// Snap to sensible steps via preset buttons — big finger targets.
-	const float btn_h = fs * 3.f;
+	/* Presets — large finger targets. */
+	const float btn_h = fs * 3.f * kBtnScale;
 	const float btn_w = (( ImGui::GetContentRegionAvail().x - fs * 2.f ) / 5.f );
 	auto preset = [&]( const char *label, float value )
 	{
@@ -559,41 +642,115 @@ void DrawTab_Settings()
 		"Текущее значение: %.2f", g_settings.r_3d_scale );
 }
 
+// ----------------------------------------------------------------------
+// Tab "About"
+// ----------------------------------------------------------------------
 void DrawTab_About()
 {
-	// Bump font size for the disclaimer block so it reads well at arm's
-	// length on a phone.
-	ImGui::SetWindowFontScale( 1.5f );
-
-	// TODO: заполнить под проект — название и краткое описание движка/игры.
 	ImGui::TextWrapped(
-		"Лаунчер игры для AuroraOS.\n\n"
-		"Новости о новых портах и играх для AuroraOS в телеграм-канале @auroraosgames" );
+		"Программа предоставляется AS IS, без каких-либо гарантий.\n\n"
+		"Ресурсы игры не распространяются с этим приложением — "
+		"приобретите игру легально и укажите путь к ним во вкладке «Игра»." );
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::Spacing();
-	// TODO: заполнить под проект — лицензия движка и ссылка на исходный код.
+	// TODO: заполнить под проект — движок, его лицензия, ссылка на исходники.
 	ImGui::TextWrapped(
-		"Лицензия движка: <указать>.\n"
-		"Исходный код: <указать ссылку>\n\n"
-		"Ресурсы игры не распространяются с этим приложением — приобретите игру легально и укажите путь к установленным ресурсам во вкладке Игра." );
+		"Движок: <указать>, лицензия <указать>.\n"
+		"Исходный код: <указать ссылку>" );
 	ImGui::Spacing();
 	ImGui::TextWrapped(
-		"Программа предоставляется AS IS, без каких-либо гарантий." );
+		"Подписывайтесь в телеграм. Свежие порты игр и новости об ОС Аврора:" );
+
+	/* Clickable link: underlined text in the theme accent colour, opened
+	   via SDL_OpenURL on tap. */
+	{
+		const ImVec4 accent( 0x3B / 255.f, 0x82 / 255.f, 0xF6 / 255.f, 1.f );
+		ImGui::PushStyleColor( ImGuiCol_Text, accent );
+		ImGui::TextUnformatted( "sashikknox Все портит! — t.me/auroraosgames" );
+		ImGui::PopStyleColor();
+		ImVec2 rmin = ImGui::GetItemRectMin();
+		ImVec2 rmax = ImGui::GetItemRectMax();
+		ImGui::GetWindowDrawList()->AddLine(
+			ImVec2( rmin.x, rmax.y ), ImVec2( rmax.x, rmax.y ),
+			ImGui::GetColorU32( accent ));
+		if( ImGui::IsItemClicked())
+			SDL_OpenURL( "https://t.me/auroraosgames" );
+	}
+
 	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::Spacing();
 	ImGui::TextWrapped(
 		"Сторонние компоненты:\n"
-		"  Dear ImGui (c) Omar Cornut, MIT license\n"
-		"" );
-
-	ImGui::SetWindowFontScale( 1.0f );
+		"  Dear ImGui (c) Omar Cornut, лицензия MIT\n"
+		"  SDL2, лицензия zlib" );
 }
 
-void DrawLauncherUI( bool &keep_running, bool &user_quit, int win_w, int win_h )
+// ----------------------------------------------------------------------
+// Tab row: custom buttons in the theme style (the stock ImGui TabBar is
+// blue and doesn't fit), rounded at the top only. The row itself is fixed
+// — only the content below it scrolls.
+// ----------------------------------------------------------------------
+int g_active_tab = 0;
+
+void DrawTabsRow()
 {
-	// Full-screen ImGui window (no decorations) so touch hits anywhere we want.
+	static const char *names[] = { "Игра", "Настройки", "О программе" };
+	const float fs       = ES();
+	const float tab_h    = fs * 2.6f * kTabScale;
+	const float gap      = fs * 0.4f;
+	const float avail    = ImGui::GetContentRegionAvail().x;
+	const float tab_w    = ( avail - gap * 2.f ) / 3.f;
+	const float rounding = fs * 0.8f;
+
+	/* Colours come from the active theme: the active tab is accented, the
+	   rest look like inactive frames. */
+	const ImVec4 accent  = ImGui::GetStyleColorVec4( ImGuiCol_SliderGrab );
+	const ImVec4 normal  = ImGui::GetStyleColorVec4( ImGuiCol_FrameBg );
+	const ImVec4 hovered = ImGui::GetStyleColorVec4( ImGuiCol_FrameBgHovered );
+
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	for( int i = 0; i < 3; i++ )
+	{
+		if( i > 0 )
+			ImGui::SameLine( 0.f, gap );
+
+		ImGui::PushID( i );
+		ImGui::InvisibleButton( "##tab", ImVec2( tab_w, tab_h ));
+		const bool sel = ( g_active_tab == i );
+		if( ImGui::IsItemClicked())
+			g_active_tab = i;
+
+		const ImVec4 col  = sel ? accent : ( ImGui::IsItemHovered() ? hovered : normal );
+		const ImVec2 rmin = ImGui::GetItemRectMin();
+		const ImVec2 rmax = ImGui::GetItemRectMax();
+		dl->AddRectFilled( rmin, rmax, ImGui::GetColorU32( col ),
+			rounding, ImDrawFlags_RoundCornersTop );
+
+		const ImVec2 ts = ImGui::CalcTextSize( names[i] );
+		dl->AddText( ImVec2( rmin.x + ( tab_w - ts.x ) * 0.5f,
+				rmin.y + ( tab_h - ts.y ) * 0.5f ),
+			ImGui::GetColorU32( ImGuiCol_Text ), names[i] );
+		ImGui::PopID();
+	}
+}
+
+// ----------------------------------------------------------------------
+// Root launcher window (fullscreen, undecorated)
+// ----------------------------------------------------------------------
+void DrawLauncherUI( bool &user_quit, int win_w, int win_h )
+{
+	/* Deferred browser open — here, at the start of the frame: the tap
+	   release that opened it is already in the previous frame and can't
+	   fall through into the window. */
+	if( g_browser_open_pending )
+	{
+		g_browser_open_pending = false;
+		g_picker.current_dir   = DefaultBrowserDir();
+		g_picker.browser_open  = true;
+	}
+
 	ImGui::SetNextWindowPos(  ImVec2( 0, 0 ));
 	ImGui::SetNextWindowSize( ImVec2( (float)win_w, (float)win_h ));
 	ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
@@ -605,38 +762,84 @@ void DrawLauncherUI( bool &keep_running, bool &user_quit, int win_w, int win_h )
 
 	ImGui::Begin( "##launcher", nullptr, flags );
 
-	const float fs = ImGui::GetFontSize();
+	const float fs = ES();
 	ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( fs * 1.0f, fs * 0.6f ));
 	ImGui::PushStyleVar( ImGuiStyleVar_ItemSpacing,  ImVec2( fs * 0.5f, fs * 0.6f ));
 
-	ImVec2 hdr = ImGui::CalcTextSize( AURORA_APP " launcher (AuroraOS)" );
+	ImVec2 hdr = ImGui::CalcTextSize( AURORA_APP " (AuroraOS)" );
 	ImGui::SetCursorPos( ImVec2(( win_w - hdr.x ) * 0.5f, fs * 1.2f ));
-	ImGui::TextUnformatted( AURORA_APP " launcher (AuroraOS)" );
+	ImGui::TextUnformatted( AURORA_APP " (AuroraOS)" );
 
-	if( ImGui::BeginTabBar( "##tabs" ))
+	/* Tab row — fixed, not scrollable. */
+	DrawTabsRow();
+	ImGui::Spacing();
+
+	/* Active tab content lives in a scrollable child: with the large font
+	   and the mod buttons it can overflow the screen height. */
+	const float exit_h = fs * 3.3f * kBtnScale;
+	const float avail_h = win_h - ImGui::GetCursorPosY() - exit_h
+		- fs * 1.5f - ImGui::GetStyle().ItemSpacing.y;
+	ImGui::BeginChild( "##content", ImVec2( 0, avail_h ), false );
+
+	switch( g_active_tab )
 	{
-		if( ImGui::BeginTabItem( "Игра" ))
-		{
-			DrawTab_Game( keep_running, user_quit, win_w, win_h );
-			ImGui::EndTabItem();
-		}
-		if( ImGui::BeginTabItem( "Настройки" ))
-		{
-			DrawTab_Settings();
-			ImGui::EndTabItem();
-		}
-		if( ImGui::BeginTabItem( "О программе" ))
-		{
-			DrawTab_About();
-			ImGui::EndTabItem();
-		}
-		ImGui::EndTabBar();
+	case 0:  DrawTab_Game();     break;
+	case 1:  DrawTab_Settings(); break;
+	default: DrawTab_About();    break;
 	}
+
+	ImGui::EndChild();
+
+	/* "Exit" — at the bottom, full width. */
+	ImGui::SetCursorPosY( win_h - exit_h - fs * 1.5f );
+	if( ImGui::Button( "Выход", ImVec2( -1, exit_h )))
+		user_quit = true;
 
 	ImGui::PopStyleVar( 2 );
 	ImGui::End();
 
 	DrawDirectoryBrowser( win_w, win_h );
+}
+
+/* One "LOADING" frame before handing control to the engine: engine init
+   and the first asset load take a noticeable while, and a frozen frame
+   with a pressed button looks broken. */
+void DrawLoadingFrame()
+{
+	int win_w = 0, win_h = 0;
+	SDL_GetWindowSize( g_window, &win_w, &win_h );
+
+	/* Drain queued events so NewFrame sees a clean state. */
+	SDL_Event drain;
+	while( SDL_PollEvent( &drain ))
+		ImGui_ImplSDL2_ProcessEvent( &drain );
+
+	ImGui_ImplOpenGL3_NewFrame();
+	ImGui_ImplSDL2_NewFrame();
+	ImGui::NewFrame();
+
+	ImGui::SetNextWindowPos(  ImVec2( 0, 0 ));
+	ImGui::SetNextWindowSize( ImVec2( (float)win_w, (float)win_h ));
+	ImGuiWindowFlags wflags = ImGuiWindowFlags_NoTitleBar
+		| ImGuiWindowFlags_NoResize
+		| ImGuiWindowFlags_NoMove
+		| ImGuiWindowFlags_NoCollapse
+		| ImGuiWindowFlags_NoBringToFrontOnFocus
+		| ImGuiWindowFlags_NoSavedSettings
+		| ImGuiWindowFlags_NoScrollbar;
+	ImGui::Begin( "##loading", nullptr, wflags );
+	const char *txt = "ЗАГРУЗКА";
+	ImVec2 sz = ImGui::CalcTextSize( txt );
+	ImGui::SetCursorPos( ImVec2(( win_w - sz.x ) * 0.5f, ( win_h - sz.y ) * 0.5f ));
+	ImGui::TextUnformatted( txt );
+	ImGui::End();
+
+	ImGui::Render();
+	glViewport( 0, 0, win_w, win_h );
+	glClearColor( 0.08f, 0.08f, 0.10f, 1.0f );
+	glClear( GL_COLOR_BUFFER_BIT );
+	ImGui_ImplOpenGL3_RenderDrawData( ImGui::GetDrawData() );
+	SDL_GL_SwapWindow( g_window );
 }
 
 } // namespace
@@ -645,9 +848,15 @@ extern "C" {
 
 launcher_result_t Launcher_Run( void )
 {
-	// SDL_INIT_VIDEO was normally already done by the engine's platform
-	// init before we got here. If it wasn't (e.g. someone wires us in
-	// earlier), bring it up.
+	/* Don't let SDL synthesise mouse events from touch: the launcher
+	   converts taps/drags itself (ProcessTouchEvent), and with synthesis
+	   enabled every tap arrives twice (SDL's pair + ours) — double clicks
+	   on buttons. Set BEFORE SDL_Init(SDL_INIT_VIDEO): the hint value is
+	   picked up by a callback during mouse initialisation. */
+	SDL_SetHint( SDL_HINT_TOUCH_MOUSE_EVENTS, "0" );
+
+	/* SDL_INIT_VIDEO was normally already done by the engine's platform
+	   init before we got here. If it wasn't, bring it up. */
 	if( SDL_WasInit( SDL_INIT_VIDEO ) == 0 )
 	{
 		if( SDL_Init( SDL_INIT_VIDEO | SDL_INIT_EVENTS ) < 0 )
@@ -659,11 +868,37 @@ launcher_result_t Launcher_Run( void )
 
 	SetGLAttributesForEngine();
 
-	Uint32 win_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_ALLOW_HIGHDPI;
-	g_window = SDL_CreateWindow( AURORA_APP " launcher (AuroraOS)",
+	/* Window size: prefer usable bounds (on a portrait panel that's e.g.
+	   1080x2400 — already accounting for the compositor transform), fall
+	   back to the desktop mode. Do NOT use a bare SDL_GetDesktopDisplayMode:
+	   it can report the panel's native landscape (e.g. 2400x1080) without
+	   rotation — the window comes out landscape and the FBO blit targets a
+	   wrong viewport. */
+	int win_w = 1080, win_h = 1920;
+	{
+		SDL_Rect bounds;
+		if( SDL_GetDisplayUsableBounds( 0, &bounds ) == 0 && bounds.w > 0 && bounds.h > 0 )
+		{
+			win_w = bounds.w;
+			win_h = bounds.h;
+		}
+		else
+		{
+			SDL_DisplayMode dm;
+			if( SDL_GetDesktopDisplayMode( 0, &dm ) == 0 )
+			{
+				win_w = dm.w;
+				win_h = dm.h;
+			}
+		}
+		printf( "Launcher: window %dx%d\n", win_w, win_h );
+		fflush( stdout );
+	}
+
+	g_window = SDL_CreateWindow( AURORA_APP " (AuroraOS)",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-		1080, 1920, // ignored because of FULLSCREEN_DESKTOP, but must be > 0
-		win_flags );
+		win_w, win_h,
+		SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN );
 	if( !g_window )
 	{
 		fprintf( stderr, "Launcher: SDL_CreateWindow failed: %s\n", SDL_GetError() );
@@ -687,78 +922,73 @@ launcher_result_t Launcher_Run( void )
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 	ImGuiIO &io = ImGui::GetIO();
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-	io.IniFilename = nullptr; // do not write imgui.ini next to the binary
+	io.IniFilename = nullptr; /* don't write imgui.ini (sandbox) */
+	io.LogFilename = nullptr;
 
-	ImGui::StyleColorsDark();
-
-	// Read the physical DPI so we can express UI dimensions in millimetres.
-	// SDL_GetDisplayDPI returns dots-per-inch; we convert to dots-per-mm.
-	// Fall back to a sensible default for desktop SDL drivers that don't
-	// report DPI.
-	float hdpi = 96.f, vdpi = 96.f;
-	SDL_GetDisplayDPI( SDL_GetWindowDisplayIndex( g_window ), nullptr, &hdpi, &vdpi );
+	/* Font size from the physical DPI: target ~4.5 mm (clamp 14..96 px so
+	   a broken/zero DPI can't produce a microscopic or gigantic font). */
+	float vdpi = 96.f;
+	SDL_GetDisplayDPI( SDL_GetWindowDisplayIndex( g_window ), nullptr, nullptr, &vdpi );
 	if( vdpi <= 1.f ) vdpi = 96.f;
-	const float dots_per_mm = vdpi / 25.4f;
-
-	// 3 mm glyph height target (with Bold weight). Clamp so a buggy/zero
-	// DPI doesn't produce a microscopic or absurdly large font.
-	float font_px = 3.0f * dots_per_mm;
+	float font_px = 4.5f * ( vdpi / 25.4f );
 	if( font_px < 14.f ) font_px = 14.f;
 	if( font_px > 96.f ) font_px = 96.f;
 
-	// Try to load the AuroraOS system Bold font. If absent, ImGui falls
-	// back to its built-in proggy font (scaled).
-	static const char *kFontPath = "/usr/share/fonts/als-hauss-variable/ALSHaussVariable-Bold.ttf";
-	static const ImWchar kRanges[] = {
-		0x0020, 0x00FF, // Latin-1 + punctuation
-		0x0400, 0x04FF, // Cyrillic
-		0x2010, 0x205E, // General Punctuation (en-dash, ellipsis, etc.)
+	/* Theme: palette + metrics from docs/imgui-theme-spec.md. */
+	AuroraLauncher_ApplyTheme( font_px );
+	/* Launcher widgets 20% more compact at the same font (paddings,
+	   roundings and other theme metrics; explicit sizes go through ES()). */
+	ImGui::GetStyle().ScaleAllSizes( kElemScale );
+
+	/* Font — embedded Noto Sans Bold (glyph ranges listed explicitly:
+	   Latin-1 + Cyrillic + General Punctuation; the em-dash 0x2014 etc.
+	   are NOT in GetGlyphRangesCyrillic and would render as "?"). Emoji
+	   ranges deliberately excluded. */
+	static const ImWchar kGlyphRanges[] = {
+		0x0020, 0x00FF, /* Latin-1 + punctuation */
+		0x0400, 0x04FF, /* Cyrillic */
+		0x2010, 0x205E, /* General Punctuation (— „ “ ” …) */
 		0,
 	};
-
+	if( io.Fonts->AddFontFromMemoryCompressedTTF(
+		NotoSansBold_compressed_data, NotoSansBold_compressed_size,
+		font_px, nullptr, kGlyphRanges ) == nullptr )
 	{
-		struct stat st;
-		if( stat( kFontPath, &st ) == 0 )
-		{
-			ImFontConfig cfg;
-			cfg.OversampleH = 2;
-			cfg.OversampleV = 1;
-			cfg.PixelSnapH  = true;
-			io.Fonts->AddFontFromFileTTF( kFontPath, font_px, &cfg, kRanges );
-		}
-		else
-		{
-			// No system font — scale built-in font to roughly the target size.
-			io.FontGlobalScale = font_px / 13.f;
-		}
+		/* Fall back to ImGui's built-in font, scaled. */
+		io.FontGlobalScale = font_px / 13.f;
 	}
-
-	// Widget metrics scaled so finger-sized buttons feel right at the
-	// device's actual DPI.
-	ImGui::GetStyle().ScaleAllSizes( font_px / 13.f );
 
 	ImGui_ImplSDL2_InitForOpenGL( g_window, g_context );
 	ImGui_ImplOpenGL3_Init( "#version 300 es" );
 
-	// Load persisted settings (path + r_3d_scale). Prefill the picker if
-	// the saved path still points at a valid resource root.
+	/* Config + resource pre-pick: the saved path, else the conventional
+	   ~/Downloads/Games/<app> — if valid, the user just presses Start. */
 	LoadSettings();
 	{
-		std::string saved = LoadConfigPath();
-		if( !saved.empty() && ValidateResourceDir( saved ))
+		std::string defdir = HomeDir() + "/Downloads/Games/" AURORA_APP;
+		if( !g_settings.path.empty() && ValidateResourceDir( g_settings.path ))
 		{
-			g_picker.selected   = saved;
+			g_picker.selected   = g_settings.path;
 			g_picker.valid_pick = true;
 		}
+		else if( ValidateResourceDir( defdir ))
+		{
+			g_picker.selected   = defdir;
+			g_picker.valid_pick = true;
+		}
+		RescanMods();
 	}
 
-	bool keep_running = true;
-	bool user_quit    = false;
+	bool user_quit = false;
 
-	while( keep_running )
+	/* Debug autostart (env AURORA_LAUNCHER_AUTO=1): after ~2.5 s call the
+	   same callback the start button would. */
+	const bool auto_start = getenv( "AURORA_LAUNCHER_AUTO" ) != nullptr;
+	const Uint32 loop_start = SDL_GetTicks();
+	bool auto_fired = false;
+
+	while( !g_launch && !user_quit )
 	{
-		int win_w = 0, win_h = 0;
 		SDL_GetWindowSize( g_window, &win_w, &win_h );
 
 		SDL_Event ev;
@@ -767,14 +997,15 @@ launcher_result_t Launcher_Run( void )
 			ImGui_ImplSDL2_ProcessEvent( &ev );
 
 			if( ev.type == SDL_QUIT )
-			{
-				keep_running = false;
-				user_quit    = true;
-			}
+				user_quit = true;
 			else if( ev.type == SDL_FINGERDOWN || ev.type == SDL_FINGERUP || ev.type == SDL_FINGERMOTION )
-			{
 				ProcessTouchEvent( ev, win_w, win_h );
-			}
+		}
+
+		if( auto_start && !auto_fired && SDL_GetTicks() - loop_start >= 2500 )
+		{
+			auto_fired = true;
+			StartGame( "" );
 		}
 
 		ImGui_ImplOpenGL3_NewFrame();
@@ -782,7 +1013,7 @@ launcher_result_t Launcher_Run( void )
 		ApplyPendingScroll();
 		ImGui::NewFrame();
 
-		DrawLauncherUI( keep_running, user_quit, win_w, win_h );
+		DrawLauncherUI( user_quit, win_w, win_h );
 
 		ImGui::Render();
 		glViewport( 0, 0, win_w, win_h );
@@ -793,95 +1024,43 @@ launcher_result_t Launcher_Run( void )
 		SDL_GL_SwapWindow( g_window );
 	}
 
-	// Hand the user's pick over to the engine.
-	//   GAME_BASEDIR — writable root (saves, configs, downloaded content).
-	//     On AuroraOS this MUST stay inside the sandboxed
-	//     ~/.local/share/<org>/<app> tree.
-	//   GAME_RODIR   — read-only root with the game assets the user picked;
-	//     passed to the engine separately (e.g. via a flag in the desktop
-	//     file's Exec line).
-	// Variable names must match what the engine actually reads.
-	// The launcher's own config also lives in the sandbox; otherwise
-	// AuroraOS silently swallows the write and the path is lost on the
-	// next launch.
-	if( !user_quit && !g_picker.selected.empty() && g_picker.valid_pick )
+	if( g_launch )
 	{
-		setenv( "GAME_BASEDIR", g_picker.selected.c_str(), 1 );
-		// setenv( "GAME_RODIR",   g_picker.selected.c_str(), 1 );
-		// GAME_RODIR is passed as a flag in the desktop Exec line instead.
-		(void)chdir( g_picker.selected.c_str());
+		/* Hand the pick over to the engine via env vars (read by the
+		   engine at init). Variable names must match what the engine
+		   actually reads. */
+		setenv( "GAME_RESDIR",    g_picker.selected.c_str(), 1 );
+		setenv( "GAME_MOD",       g_launch_mod.c_str(),      1 );
+		char scale_buf[32];
+		snprintf( scale_buf, sizeof( scale_buf ), "%.3f", g_settings.r_3d_scale );
+		setenv( "GAME_R_3D_SCALE", scale_buf, 1 );
+
 		g_settings.path = g_picker.selected;
-		SaveSettings();
-
-		// Hand r_3d_scale to the engine via env var; the engine reads it
-		// when registering its r_3d_scale cvar. Variable names must match
-		// what the engine actually reads.
-		{
-			char buf[32];
-			snprintf( buf, sizeof( buf ), "%.3f", g_settings.r_3d_scale );
-			setenv( "GAME_R_3D_SCALE", buf, 1 );
-		}
 	}
+	/* Save the config on quit too — settings must not be lost. */
+	SaveSettings();
 
-	// Show a single "LOADING" frame before we hand control to the engine.
-	// Engine initialisation + first asset load can take a noticeable second
-	// or two on a fresh device, and freezing the pressed-button frame looks
-	// broken.
-	if( !user_quit )
-	{
-		int win_w = 0, win_h = 0;
-		SDL_GetWindowSize( g_window, &win_w, &win_h );
+	if( g_launch )
+		DrawLoadingFrame();
 
-		// Drain any leftover queued events so NewFrame sees a clean state.
-		SDL_Event drain;
-		while( SDL_PollEvent( &drain ))
-			ImGui_ImplSDL2_ProcessEvent( &drain );
-
-		ImGui_ImplOpenGL3_NewFrame();
-		ImGui_ImplSDL2_NewFrame();
-		ImGui::NewFrame();
-
-		ImGui::SetNextWindowPos(  ImVec2( 0, 0 ));
-		ImGui::SetNextWindowSize( ImVec2( (float)win_w, (float)win_h ));
-		ImGuiWindowFlags wflags = ImGuiWindowFlags_NoTitleBar
-			| ImGuiWindowFlags_NoResize
-			| ImGuiWindowFlags_NoMove
-			| ImGuiWindowFlags_NoCollapse
-			| ImGuiWindowFlags_NoBringToFrontOnFocus
-			| ImGuiWindowFlags_NoSavedSettings
-			| ImGuiWindowFlags_NoScrollbar;
-		ImGui::Begin( "##loading", nullptr, wflags );
-		const char *txt = "ЗАГРУЗКА";
-		ImVec2 sz = ImGui::CalcTextSize( txt );
-		ImGui::SetCursorPos( ImVec2(( win_w - sz.x ) * 0.5f, ( win_h - sz.y ) * 0.5f ));
-		ImGui::TextUnformatted( txt );
-		ImGui::End();
-
-		ImGui::Render();
-		glViewport( 0, 0, win_w, win_h );
-		glClearColor( 0.08f, 0.08f, 0.10f, 1.0f );
-		glClear( GL_COLOR_BUFFER_BIT );
-		ImGui_ImplOpenGL3_RenderDrawData( ImGui::GetDrawData() );
-		SDL_GL_SwapWindow( g_window );
-	}
-
-	// Tear down ImGui — it releases its own VAO/VBO/program/font texture.
-	// The SDL window and GL context stay alive and become the engine's.
+	/* Tear down ImGui — it releases its own VAO/VBO/program/font texture.
+	   The SDL window and GL context stay alive and become the engine's.
+	   No SDL_Quit here. */
 	ImGui_ImplOpenGL3_Shutdown();
 	ImGui_ImplSDL2_Shutdown();
 	ImGui::DestroyContext();
 
-	if( user_quit )
+	if( !g_launch )
 	{
-		// User asked to quit before the engine ran. Tear down our own
-		// window/context.
+		/* User asked to quit before the engine ran. Tear down our own
+		   window/context. */
 		if( g_context ) { SDL_GL_DeleteContext( g_context ); g_context = nullptr; }
 		if( g_window  ) { SDL_DestroyWindow ( g_window  );  g_window  = nullptr; }
 		g_owned = false;
 		return LAUNCHER_QUIT;
 	}
 
-	// Hand the bare GL context back to a clean state for the engine.
+	/* Hand the bare GL context back to a clean state for the engine. */
 	SDL_GL_MakeCurrent( g_window, g_context );
 	return LAUNCHER_CONTINUE;
 }
@@ -898,7 +1077,7 @@ void *Launcher_GetGLContext( void )
 
 void Launcher_ReleaseOwnership( void )
 {
-	// Engine has adopted the window/context; we no longer free them.
+	/* Engine has adopted the window/context; we no longer free them. */
 	g_owned = false;
 }
 
