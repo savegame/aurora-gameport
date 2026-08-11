@@ -518,3 +518,12 @@ void maliit_client_set_surrounding_text( const char *text, int32_t cursor_pos )
 	server_call( "updateWidgetInformation",
 		g_variant_new( "(vb)", g_variant_builder_end( &b ), FALSE ) );
 }
+
+void maliit_client_set_orientation( int32_t angle_degrees )
+{
+	if( !g.ready ) return;
+	server_call( "appOrientationAboutToChange",
+		g_variant_new( "(i)", angle_degrees ) );
+	server_call( "appOrientationChanged",
+		g_variant_new( "(i)", angle_degrees ) );
+}

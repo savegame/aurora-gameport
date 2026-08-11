@@ -138,6 +138,16 @@ void maliit_client_reset( void );
  */
 void maliit_client_set_surrounding_text( const char *text, int32_t cursor_pos );
 
+/*
+ * Tell the IM server the current content orientation, in degrees
+ * (0/90/180/270). The server shows and lays out the on-screen
+ * keyboard according to this value, so it must track the app content:
+ * call this TOGETHER with wl_surface_set_buffer_transform on every
+ * orientation change, and once when the keyboard is shown.
+ * Sends appOrientationAboutToChange + appOrientationChanged.
+ */
+void maliit_client_set_orientation( int32_t angle_degrees );
+
 #ifdef __cplusplus
 }
 #endif

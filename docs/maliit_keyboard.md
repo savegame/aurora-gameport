@@ -70,6 +70,31 @@ session bus напрямую, а через **peer-to-peer DBus-соединен
    `updateWidgetInformation` с `focusState=false`), когда ввод
    завершён.
 
+## Ориентация контента
+
+Сервер клавиатуры должен знать текущую ориентацию контента
+приложения — иначе клавиатура откроется не в той ориентации.
+Для этого на интерфейсе `uiserver1` есть два вызова:
+
+- `appOrientationAboutToChange(int32)` — предупреждение о смене;
+- `appOrientationChanged(int32)` — фактическая смена.
+
+Аргумент — угол в градусах (0/90/180/270). Вызывать **вместе с
+`wl_surface_set_buffer_transform`** на каждой смене ориентации
+(см. «Этап 3. Поворот и ресайз контента» в AGENTS.MD), а также
+при показе клавиатуры. Маппинг из `SDL_DisplayOrientation`
+(как в платформенной SDL2 ОС Аврора):
+
+| SDL_DisplayOrientation | Градусы |
+|---|---|
+| `SDL_ORIENTATION_PORTRAIT` | 0 |
+| `SDL_ORIENTATION_PORTRAIT_FLIPPED` | 180 |
+| `SDL_ORIENTATION_LANDSCAPE` | 270 |
+| `SDL_ORIENTATION_LANDSCAPE_FLIPPED` | 90 |
+
+В обёртке это один вызов — `maliit_client_set_orientation(angle)`,
+он отправляет оба метода подряд.
+
 ## Тонкости
 
 - **GLib main context.** Реализация на GDBus доставляет входящие
@@ -100,6 +125,7 @@ session bus напрямую, а через **peer-to-peer DBus-соединен
   Никакой привязки к движку, файлы можно копировать в проект как
   есть. Публичный API: `maliit_client_init/shutdown/pump`,
   `maliit_client_show/hide`, `maliit_client_focus_in/focus_out`,
+  `maliit_client_set_orientation` (см. «Ориентация контента»),
   настройки контента (`maliit_client_set_content_type`,
   `maliit_client_set_password_mode` и др.).
 - `maliit_bridge.h` / `maliit_bridge.c` — пример моста обёртки
