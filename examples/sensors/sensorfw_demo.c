@@ -9,6 +9,8 @@
  * Usage: sensorfw_demo [accelerometersensor|gyroscopesensor] [seconds]
  */
 
+#define _POSIX_C_SOURCE 200809L /* clock_gettime() */
+
 #include "sensorfw_client.h"
 
 #include <poll.h>
@@ -33,13 +35,32 @@ static uint64_t now_ms( void )
 
 int main( int argc, char **argv )
 {
-	const char *sensor_id = argc > 1 ? argv[1] : "accelerometersensor";
+	const char *type_name = argc > 1 ? argv[1] : sensorfw_sensor_type_name( SENSORFW_SENSOR_ACCELEROMETER );
 	int seconds = argc > 2 ? atoi( argv[2] ) : 5;
 
-	sensorfw_client_t *client = sensorfw_client_open( sensor_id );
+	sensorfw_sensor_type_t type;
+	if( !sensorfw_sensor_type_from_name( type_name, &type ) )
+	{
+		fprintf( stderr, "'%s' is not a known sensor type (accelerometersensor, gyroscopesensor)\n", type_name );
+		return 1;
+	}
+
+	sensorfw_sensor_type_t available[SENSORFW_SENSOR_TYPE_COUNT];
+	int n = sensorfw_client_list_available( available, SENSORFW_SENSOR_TYPE_COUNT );
+	bool present = false;
+	for( int i = 0; i < n; ++i )
+		if( available[i] == type )
+			present = true;
+	if( !present )
+	{
+		fprintf( stderr, "'%s' is not among the sensors sensorfwd reports for this device\n", type_name );
+		return 1;
+	}
+
+	sensorfw_client_t *client = sensorfw_client_open( type );
 	if( !client )
 	{
-		fprintf( stderr, "failed to open '%s'\n", sensor_id );
+		fprintf( stderr, "failed to open '%s'\n", type_name );
 		return 1;
 	}
 
@@ -50,7 +71,7 @@ int main( int argc, char **argv )
 		return 1;
 	}
 
-	printf( "reading '%s' for %d s (fd=%d) ...\n", sensor_id, seconds, sensorfw_client_fd( client ) );
+	printf( "reading '%s' for %d s (fd=%d) ...\n", type_name, seconds, sensorfw_client_fd( client ) );
 
 	uint64_t deadline = now_ms() + (uint64_t)seconds * 1000;
 	while( now_ms() < deadline )

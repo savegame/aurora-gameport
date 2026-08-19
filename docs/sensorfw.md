@@ -24,8 +24,28 @@ sensorfwd получает данные через hybris-адаптеры — �
 
 ## Управление сессией (D-Bus)
 
+`id` во всех вызовах ниже — логическое имя сенсора внутри sensorfwd
+(`accelerometersensor`, `gyroscopesensor` и т.п.), одна и та же
+строка используется и в `loadPlugin`/`requestSensor`/`releaseSensor`,
+и как суффикс объекта сенсора (`/SensorManager/<id>`, см. ниже). Это
+не придуманное клиентом имя — его нужно взять из списка, который
+знает сам sensorfwd:
+
+```
+dbus-send --system --print-reply --dest=com.nokia.SensorService \
+  /SensorManager local.SensorManager.availableSensorPlugins
+```
+
+Метод возвращает массив строк — все `id`, доступные на данном
+устройстве (обычно среди них `accelerometersensor`, `alssensor`,
+`compasssensor`, `gyroscopesensor`, `magnetometersensor`,
+`orientationsensor`, `pressuresensor`, `proximitysensor`,
+`rotationsensor` — но состав зависит от железа, поэтому источник
+истины — сам вызов, а не этот список).
+
 ```
 /SensorManager   local.SensorManager
+    availableSensorPlugins() -> as              (список id, см. выше)
     loadPlugin(s: id) -> b
     requestSensor(s: id, x: pid) -> i sessionId
     releaseSensor(s: id, i: sessionId, x: pid) -> b
@@ -35,7 +55,8 @@ sensorfwd получает данные через hybris-адаптеры — �
 иначе сессия не создаётся, с ошибкой вида `requested sensor id
 '...' not registered`.
 
-После `loadPlugin` появляется объект конкретного сенсора:
+После `loadPlugin(id)` появляется D-Bus объект этого сенсора,
+`/SensorManager/<id>` — тот же `id`, что и в вызове:
 
 ```
 /SensorManager/accelerometersensor   local.AccelerometerSensor
@@ -149,10 +170,28 @@ X-Sailjail-Permissions=Sensors;...
   чистом C, реализует протокол выше. Зависимость — `libdbus-1` (для
   сессии), сам сокет — обычный POSIX.
 
-  Публичный API:
+  `sensorfw_client_open()` принимает не произвольную строку, а
+  значение `enum sensorfw_sensor_type_t` — набор сенсоров, для
+  которых и D-Bus интерфейс, и раскладка данных из «Формата элемента
+  данных» выше подтверждены на реальном железе. Так опечатка в `id`
+  или попытка открыть сенсор с ещё не проверенной раскладкой не
+  проходят на этапе компиляции/вызова, а не всплывают позже как
+  «странные» данные:
 
   ```c
-  sensorfw_client_t *sensorfw_client_open( const char *sensor_id );
+  typedef enum {
+      SENSORFW_SENSOR_ACCELEROMETER,
+      SENSORFW_SENSOR_GYROSCOPE,
+      SENSORFW_SENSOR_TYPE_COUNT
+  } sensorfw_sensor_type_t;
+
+  const char *sensorfw_sensor_type_name( sensorfw_sensor_type_t type );
+  bool sensorfw_sensor_type_from_name( const char *name, sensorfw_sensor_type_t *out );
+
+  /* какие из типов выше реально есть на этом устройстве */
+  int sensorfw_client_list_available( sensorfw_sensor_type_t *out, int max_types );
+
+  sensorfw_client_t *sensorfw_client_open( sensorfw_sensor_type_t type );
   void sensorfw_client_close( sensorfw_client_t *client );
   bool sensorfw_client_set_interval_ms( sensorfw_client_t *client, int interval_ms );
   bool sensorfw_client_start( sensorfw_client_t *client );
@@ -161,10 +200,17 @@ X-Sailjail-Permissions=Sensors;...
   bool sensorfw_client_pump( sensorfw_client_t *client, sensorfw_sample_cb cb, void *user_data );
   ```
 
-  Типичный цикл (как `mce_keepalive_pump()` — раз в кадр):
+  Типичный цикл: сначала узнать, что реально есть на устройстве,
+  затем открыть нужный тип (как `mce_keepalive_pump()` — `pump()`
+  дёргать раз в кадр):
 
   ```c
-  sensorfw_client_t *accel = sensorfw_client_open( "accelerometersensor" );
+  sensorfw_sensor_type_t available[SENSORFW_SENSOR_TYPE_COUNT];
+  int n = sensorfw_client_list_available( available, SENSORFW_SENSOR_TYPE_COUNT );
+  /* найти SENSORFW_SENSOR_GYROSCOPE среди available[0..n) перед открытием,
+   * если он не гарантирован на всех целевых устройствах */
+
+  sensorfw_client_t *accel = sensorfw_client_open( SENSORFW_SENSOR_ACCELEROMETER );
   sensorfw_client_set_interval_ms( accel, 20 ); /* ~50 Hz */
   sensorfw_client_start( accel );
   /* в главном цикле: */
@@ -177,13 +223,24 @@ X-Sailjail-Permissions=Sensors;...
   `O_NONBLOCK` сразу после хендшейка, кадр разбирается по частям
   между вызовами — безопасно дёргать каждый кадр игрового цикла.
 
+  Отдельно, только для расширения набора поддерживаемых типов —
+  диагностический путь в обход enum: `sensorfw_client_list_plugins_raw()`
+  (полный список id, которые знает демон на этом устройстве, без
+  фильтрации по `sensorfw_sensor_type_t`) и `sensorfw_client_open_raw(id)`
+  (открыть по произвольному id, с угадыванием имени D-Bus интерфейса
+  по конвенции). У результата `sensorfw_client_open_raw()` раскладка
+  данных для `sensorfw_client_pump()` не гарантирована — использовать
+  вместе с `sensorfw_rawdump.c`, не для реального чтения показаний.
+
 - `sensorfw_demo.c` и `sensorfw_rawdump.c` — не рабочий код, а
   диагностические утилиты **на крайний случай**: если на конкретном
   устройстве показания не сходятся с описанным выше протоколом
   (шум, `NaN`, десинки кадров и т.п.). `sensorfw_demo` печатает
   распарсенные показания сенсора в stdout, `sensorfw_rawdump` —
   сырые байты кадров без интерпретации, чтобы свериться с реальной
-  раскладкой на этом устройстве. Использовать их для отладки —
+  раскладкой на этом устройстве (`sensorfw_rawdump --list` — вывести
+  все id, которые демон знает на этом устройстве). Использовать их
+  для отладки —
   собрать под целевую архитектуру и **выполнить бинарник на
   устройстве только после явного одобрения пользователя**: на
   устройствах с контролем целостности исполняемых файлов

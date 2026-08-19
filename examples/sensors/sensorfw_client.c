@@ -5,6 +5,8 @@
  *
  *   1. D-Bus (system bus), service com.nokia.SensorService:
  *        /SensorManager  local.SensorManager
+ *          availableSensorPlugins() -> as               [list of ids
+ *            sensorfwd knows about on this device]
  *          loadPlugin(s: id) -> b                       [MUST be called
  *            first -- requestSensor() on an unloaded id fails with
  *            "requested sensor id '...' not registered", verified
@@ -43,6 +45,7 @@
 
 #include "sensorfw_client.h"
 
+#include <ctype.h>
 #include <dbus/dbus.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -105,35 +108,28 @@ _Static_assert( sizeof( sensorfw_wire_xyz_t ) == 24, "TimedXyzData wire layout m
 
 typedef struct
 {
-	const char *id;
-	const char *iface;
-	bool        verified_on_device;
-} sensorfw_iface_entry_t;
+	sensorfw_sensor_type_t type;
+	const char             *id;
+	const char             *iface;
+} sensorfw_type_entry_t;
 
-static const sensorfw_iface_entry_t SENSORFW_IFACES[] =
+/* Only sensor types whose D-Bus interface name AND sensorfw_wire_xyz_t
+ * socket layout are both confirmed on real hardware belong here (see
+ * docs/sensorfw.md). This is the whole point of sensorfw_sensor_type_t:
+ * sensorfw_client_open() can only pick from this table, so a caller
+ * can never accidentally open a sensor id this client would parse
+ * incorrectly. */
+static const sensorfw_type_entry_t SENSORFW_TYPES[] =
 {
-	/* Verified via `dbus-send --system ... Introspect` on-device. */
-	{ "accelerometersensor", "local.AccelerometerSensor", true },
-	{ "gyroscopesensor",     "local.GyroscopeSensor",     true },
-
-	/* NOT verified on-device -- inferred only from sensorfw's
-	 * qt-api naming convention (magnetometersensor_i.h /
-	 * local.MagnetometerSensor etc). Re-check with dbus-send
-	 * introspection on /SensorManager/<id> before relying on
-	 * these; sensorfw_client_open() will still work as long as
-	 * the guess is right, since it uses the exact same D-Bus
-	 * calls, but a wrong interface name fails loudly (method
-	 * call errors), not silently. */
-	{ "magnetometersensor",  "local.MagnetometerSensor",  false },
-	{ "orientationsensor",   "local.OrientationSensor",   false },
-	{ "rotationsensor",      "local.RotationSensor",      false },
+	{ SENSORFW_SENSOR_ACCELEROMETER, "accelerometersensor", "local.AccelerometerSensor" },
+	{ SENSORFW_SENSOR_GYROSCOPE,     "gyroscopesensor",     "local.GyroscopeSensor" },
 };
 
 struct sensorfw_client
 {
 	DBusConnection *bus;
 	char           *sensor_id;
-	const char     *iface;
+	char            iface[80];
 	char            object_path[128];
 	int             fd;
 	int32_t         session_id;
@@ -151,19 +147,58 @@ struct sensorfw_client
 
 /* ------------------------------------------------------------------------- */
 
-static const char *sensorfw_iface_for_id( const char *id )
+static const sensorfw_type_entry_t *entry_for_type( sensorfw_sensor_type_t type )
 {
-	for( size_t i = 0; i < sizeof( SENSORFW_IFACES ) / sizeof( SENSORFW_IFACES[0] ); ++i )
+	for( size_t i = 0; i < sizeof( SENSORFW_TYPES ) / sizeof( SENSORFW_TYPES[0] ); ++i )
+		if( SENSORFW_TYPES[i].type == type )
+			return &SENSORFW_TYPES[i];
+	return NULL;
+}
+
+const char *sensorfw_sensor_type_name( sensorfw_sensor_type_t type )
+{
+	const sensorfw_type_entry_t *e = entry_for_type( type );
+	return e ? e->id : "?";
+}
+
+bool sensorfw_sensor_type_from_name( const char *name, sensorfw_sensor_type_t *out )
+{
+	if( !name )
+		return false;
+	for( size_t i = 0; i < sizeof( SENSORFW_TYPES ) / sizeof( SENSORFW_TYPES[0] ); ++i )
 	{
-		if( strcmp( SENSORFW_IFACES[i].id, id ) == 0 )
+		if( strcmp( SENSORFW_TYPES[i].id, name ) == 0 )
 		{
-			if( !SENSORFW_IFACES[i].verified_on_device )
-				fprintf( stderr, "sensorfw_client: interface for '%s' is not verified "
-				         "on-device -- double-check with dbus-send introspection\n", id );
-			return SENSORFW_IFACES[i].iface;
+			if( out )
+				*out = SENSORFW_TYPES[i].type;
+			return true;
 		}
 	}
-	return NULL;
+	return false;
+}
+
+/* Mechanical guess of the local.<Type>Sensor D-Bus interface name for
+ * an arbitrary sensorfwd plugin id, following the pattern of the two
+ * confirmed entries in SENSORFW_TYPES (accelerometersensor ->
+ * local.AccelerometerSensor). Diagnostic use only -- see
+ * sensorfw_client_open_raw() in the header. */
+static void derive_probable_iface( const char *id, char *out, size_t out_size )
+{
+	static const char SUFFIX[] = "sensor";
+	size_t len = strlen( id );
+	size_t suffix_len = strlen( SUFFIX );
+	size_t prefix_len = ( len > suffix_len && strcmp( id + len - suffix_len, SUFFIX ) == 0 )
+	                     ? len - suffix_len : len;
+
+	char prefix[64] = {0};
+	size_t n = 0;
+	if( prefix_len > 0 && prefix_len < sizeof( prefix ) )
+	{
+		prefix[n++] = (char)toupper( (unsigned char)id[0] );
+		for( size_t i = 1; i < prefix_len; ++i )
+			prefix[n++] = id[i];
+	}
+	snprintf( out, out_size, "local.%sSensor", prefix );
 }
 
 static DBusMessage *sensorfw_call_sync( DBusConnection *bus, const char *path, const char *iface,
@@ -191,21 +226,129 @@ static DBusMessage *sensorfw_call_sync( DBusConnection *bus, const char *path, c
 	return reply;
 }
 
-/* ------------------------------------------------------------------------- */
-
-sensorfw_client_t *sensorfw_client_open( const char *sensor_id )
+/* Walks the `as` (array of string) reply of availableSensorPlugins()
+ * and calls visit(id, ctx) for each entry. */
+static bool for_each_plugin_id( DBusMessage *reply, void ( *visit )( const char *id, void *ctx ), void *ctx )
 {
-	if( !sensor_id )
-		return NULL;
+	DBusMessageIter iter, sub;
+	if( !dbus_message_iter_init( reply, &iter ) || dbus_message_iter_get_arg_type( &iter ) != DBUS_TYPE_ARRAY )
+		return false;
 
-	const char *iface = sensorfw_iface_for_id( sensor_id );
-	if( !iface )
+	dbus_message_iter_recurse( &iter, &sub );
+	while( dbus_message_iter_get_arg_type( &sub ) == DBUS_TYPE_STRING )
 	{
-		fprintf( stderr, "sensorfw_client: unknown sensor id '%s' "
-		         "(add it to SENSORFW_IFACES in sensorfw_client.c)\n", sensor_id );
+		const char *id = NULL;
+		dbus_message_iter_get_basic( &sub, &id );
+		visit( id, ctx );
+		dbus_message_iter_next( &sub );
+	}
+	return true;
+}
+
+/* Opens its own short-lived system bus connection and calls
+ * availableSensorPlugins(). Caller must dbus_message_unref() the
+ * reply and dbus_connection_unref() *bus_out on success. */
+static DBusMessage *query_available_plugins( DBusConnection **bus_out )
+{
+	DBusError err;
+	dbus_error_init( &err );
+
+	DBusConnection *bus = dbus_bus_get( DBUS_BUS_SYSTEM, &err );
+	if( !bus )
+	{
+		fprintf( stderr, "sensorfw_client: system bus unreachable: %s\n", err.message );
+		dbus_error_free( &err );
+		return NULL;
+	}
+	dbus_connection_set_exit_on_disconnect( bus, FALSE );
+
+	DBusMessage *reply = sensorfw_call_sync( bus, SENSORFW_OBJECT_PATH, SENSORFW_MANAGER_IFACE,
+	                                          "availableSensorPlugins", &err, DBUS_TYPE_INVALID );
+	if( !reply )
+	{
+		fprintf( stderr, "sensorfw_client: availableSensorPlugins() failed: %s\n", err.message );
+		dbus_error_free( &err );
+		dbus_connection_unref( bus );
 		return NULL;
 	}
 
+	*bus_out = bus;
+	return reply;
+}
+
+typedef struct { sensorfw_sensor_type_t *out; int cap; int count; } list_available_ctx_t;
+
+static void list_available_visit( const char *id, void *ctx_ )
+{
+	list_available_ctx_t *ctx = ctx_;
+	sensorfw_sensor_type_t type;
+	if( ctx->count < ctx->cap && sensorfw_sensor_type_from_name( id, &type ) )
+		ctx->out[ctx->count++] = type;
+}
+
+int sensorfw_client_list_available( sensorfw_sensor_type_t *out, int max_types )
+{
+	if( !out || max_types <= 0 )
+		return 0;
+
+	DBusConnection *bus = NULL;
+	DBusMessage *reply = query_available_plugins( &bus );
+	if( !reply )
+		return 0;
+
+	list_available_ctx_t ctx = { out, max_types, 0 };
+	for_each_plugin_id( reply, list_available_visit, &ctx );
+
+	dbus_message_unref( reply );
+	dbus_connection_unref( bus );
+	return ctx.count;
+}
+
+typedef struct { char **out; int cap; int count; } list_raw_ctx_t;
+
+static void list_raw_visit( const char *id, void *ctx_ )
+{
+	list_raw_ctx_t *ctx = ctx_;
+	if( ctx->count < ctx->cap )
+		ctx->out[ctx->count++] = strdup( id );
+}
+
+char **sensorfw_client_list_plugins_raw( int *out_count )
+{
+	if( out_count )
+		*out_count = 0;
+
+	DBusConnection *bus = NULL;
+	DBusMessage *reply = query_available_plugins( &bus );
+	if( !reply )
+		return NULL;
+
+	enum { MAX_PLUGINS = 64 };
+	char **list = calloc( MAX_PLUGINS, sizeof( char * ) );
+	list_raw_ctx_t ctx = { list, MAX_PLUGINS, 0 };
+	for_each_plugin_id( reply, list_raw_visit, &ctx );
+
+	dbus_message_unref( reply );
+	dbus_connection_unref( bus );
+
+	if( out_count )
+		*out_count = ctx.count;
+	return list;
+}
+
+void sensorfw_client_free_plugin_list( char **list, int count )
+{
+	if( !list )
+		return;
+	for( int i = 0; i < count; ++i )
+		free( list[i] );
+	free( list );
+}
+
+/* ------------------------------------------------------------------------- */
+
+static sensorfw_client_t *open_impl( const char *sensor_id, const char *iface )
+{
 	DBusError err;
 	dbus_error_init( &err );
 
@@ -301,7 +444,7 @@ sensorfw_client_t *sensorfw_client_open( const char *sensor_id )
 	sensorfw_client_t *client = calloc( 1, sizeof( *client ) );
 	client->bus = bus;
 	client->sensor_id = strdup( sensor_id );
-	client->iface = iface;
+	snprintf( client->iface, sizeof( client->iface ), "%s", iface );
 	snprintf( client->object_path, sizeof( client->object_path ), "%s/%s", SENSORFW_OBJECT_PATH, sensor_id );
 	client->fd = fd;
 	client->session_id = session_id;
@@ -323,6 +466,33 @@ fail_release:
 	}
 	dbus_connection_unref( bus );
 	return NULL;
+}
+
+sensorfw_client_t *sensorfw_client_open( sensorfw_sensor_type_t type )
+{
+	const sensorfw_type_entry_t *e = entry_for_type( type );
+	if( !e )
+	{
+		fprintf( stderr, "sensorfw_client: unknown sensor type %d\n", (int)type );
+		return NULL;
+	}
+	return open_impl( e->id, e->iface );
+}
+
+sensorfw_client_t *sensorfw_client_open_raw( const char *sensor_id )
+{
+	if( !sensor_id )
+		return NULL;
+
+	sensorfw_sensor_type_t known;
+	if( sensorfw_sensor_type_from_name( sensor_id, &known ) )
+		return open_impl( sensor_id, entry_for_type( known )->iface );
+
+	char iface[80];
+	derive_probable_iface( sensor_id, iface, sizeof( iface ) );
+	fprintf( stderr, "sensorfw_client: '%s' is not a vetted sensor type -- guessing D-Bus interface "
+	         "'%s' (diagnostic use only, verify with dbus-send introspection)\n", sensor_id, iface );
+	return open_impl( sensor_id, iface );
 }
 
 void sensorfw_client_close( sensorfw_client_t *client )

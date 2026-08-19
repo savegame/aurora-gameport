@@ -1,10 +1,15 @@
 /*
  * sensorfw_rawdump.c -- diagnostic tool: dump raw bytes of sensorfw
  * data frames without interpreting them, to verify/derive the actual
- * on-wire struct layout for a given sensorfwd build. Not part of the
- * game; keep for future protocol debugging (docs/sensorfw.md).
+ * on-wire struct layout for a given sensorfwd build -- including for
+ * sensor ids sensorfw_client.h doesn't know about yet (see
+ * sensorfw_client_open_raw() and the "diagnostic-only" section of
+ * sensorfw_client.h). Not part of the game; keep for future protocol
+ * debugging (docs/sensorfw.md).
  *
  * Usage: sensorfw_rawdump [sensor_id] [frame_count]
+ *        sensorfw_rawdump --list          (print sensor ids sensorfwd
+ *                                           reports for this device)
  */
 
 #include "sensorfw_client.h"
@@ -18,10 +23,20 @@
 
 int main( int argc, char **argv )
 {
+	if( argc > 1 && strcmp( argv[1], "--list" ) == 0 )
+	{
+		int count = 0;
+		char **ids = sensorfw_client_list_plugins_raw( &count );
+		for( int i = 0; i < count; ++i )
+			printf( "%s\n", ids[i] );
+		sensorfw_client_free_plugin_list( ids, count );
+		return 0;
+	}
+
 	const char *sensor_id = argc > 1 ? argv[1] : "accelerometersensor";
 	int max_frames = argc > 2 ? atoi( argv[2] ) : 10;
 
-	sensorfw_client_t *client = sensorfw_client_open( sensor_id );
+	sensorfw_client_t *client = sensorfw_client_open_raw( sensor_id );
 	if( !client )
 		return 1;
 
