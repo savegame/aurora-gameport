@@ -23,6 +23,25 @@ API модуля:
   точные градусы не нужны);
 - метод отрисовки квада с текстурой FBO на экран.
 
+Формат буферов (проверенный рабочий вариант):
+- цвет — текстура GL_TEXTURE_2D, внутренний формат GL_RGBA, тип
+  GL_UNSIGNED_BYTE; фильтрация NEAREST или LINEAR, wrap —
+  GL_CLAMP_TO_EDGE; attach к GL_COLOR_ATTACHMENT0;
+- глубина и стенсил — ОДИН совмещённый renderbuffer
+  GL_DEPTH24_STENCIL8_OES: один и тот же renderbuffer аттачится
+  и к GL_DEPTH_ATTACHMENT, и к GL_STENCIL_ATTACHMENT. Требует
+  расширение GL_OES_packed_depth_stencil — наличие проверять в
+  рантайме по glGetString(GL_EXTENSIONS);
+- если расширения нет — только глубина: renderbuffer
+  GL_DEPTH_COMPONENT16, attach ТОЛЬКО к GL_DEPTH_ATTACHMENT;
+  рендер без стенсила (стенсил-эффекты движка при этом отключаются);
+- пару ОТДЕЛЬНЫХ renderbuffer'ов GL_DEPTH_COMPONENT16 +
+  GL_STENCIL_INDEX8 не использовать: такая комбинация может не
+  поддерживаться драйвером (glCheckFramebufferStatus вернёт
+  GL_FRAMEBUFFER_UNSUPPORTED);
+- после сборки FBO всегда проверять glCheckFramebufferStatus и
+  логировать результат (выбранный вариант и статус).
+
 Вывод на экран:
 - по возможности использовать API отрисовки движка; если проще
   GLES3 — использовать GLES3;
