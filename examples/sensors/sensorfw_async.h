@@ -166,10 +166,14 @@ typedef enum
  * One parsed sample. timestamp_us is sensorfwd's monotonic clock in
  * microseconds -- deltas only, not wall clock.
  *
- * x/y/z are raw int32 driver counts widened to float for
- * convenience, NOT SI units. For the accelerometer they look like
- * milli-g (device flat -> z near 1000). The gyroscope scale is not
- * established anywhere; measure it, do not assume it.
+ * x/y/z are int32 values widened to float for convenience, NOT SI
+ * units, but the units are known and already calibrated: the
+ * accelerometer is in milli-g (device flat -> z near 1000), the
+ * gyroscope in milli-degrees per second. The sensorfw hybris adaptor
+ * converts the calibrated Android HAL values (m/s^2, rad/s) into these
+ * units, and QtSensors scales them back by a constant factor. No
+ * calibration is required -- see "Единицы и калибровка" in
+ * docs/sensorfw.md.
  */
 typedef void (*sensorfw_async_sample_cb)( void *user_data, uint64_t timestamp_us,
                                           float x, float y, float z );

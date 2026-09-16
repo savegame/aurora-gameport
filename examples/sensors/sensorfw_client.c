@@ -92,8 +92,10 @@ typedef struct
  *                         device flat, 4th field a session-constant.
  *   gyroscopesensor:      x,y,z small noise at rest, 4th field a
  *                         (different) session-constant.
- * z landing near 1000 while flat strongly suggests raw milli-g units
- * for the accelerometer (not SI m/s^2, not floating point g). The
+ * The accelerometer is in milli-g and the gyroscope in milli-degrees
+ * per second (not SI, not floating point) -- confirmed from the
+ * sensorfw hybris adaptor and QtSensors sources and on a device, see
+ * "Единицы и калибровка" in docs/sensorfw.md. The
  * 4th field's meaning is unconfirmed (constant per session/sensor
  * type, differs between accelerometer and gyroscope -- looks like a
  * per-type status/range/accuracy word, not per-sample data) and is

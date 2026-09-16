@@ -93,11 +93,11 @@ int sensorfw_client_list_available( sensorfw_sensor_type_t *out, int max_types )
  * particular epoch; only useful for computing deltas between samples.
  *
  * x/y/z are passed through as float only for convenience -- sensorfwd
- * actually streams raw int32 driver counts, not SI units or
- * floating-point g (see docs/sensorfw.md and sensorfw_client.c). For
- * the accelerometer these look like milli-g (device flat -> z near
- * 1000, x/y near 0); treat any scaling as unverified until
- * cross-checked on the target device.
+ * actually streams int32 values, not SI units or floating-point g.
+ * The units are known and already calibrated: accelerometer in
+ * milli-g (device flat -> z near 1000, x/y near 0), gyroscope in
+ * milli-degrees per second. No calibration is required -- see
+ * "Единицы и калибровка" in docs/sensorfw.md.
  */
 typedef void (*sensorfw_sample_cb)( void *user_data, uint64_t timestamp_us,
                                      float x, float y, float z );
